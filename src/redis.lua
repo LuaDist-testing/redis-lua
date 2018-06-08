@@ -1,7 +1,5 @@
--- module('Redis')
-
 local redis = {
-    _VERSION     = 'redis-lua 2.0.3',
+    _VERSION     = 'redis-lua 2.0.4',
     _DESCRIPTION = 'A Lua client library for the redis key value storage system.',
     _COPYRIGHT   = 'Copyright (C) 2009-2012 Daniele Alessandri',
 }
@@ -11,21 +9,14 @@ local redis = {
 -- the module to a local variable when requiring it: `local redis = require('redis')`.
 Redis = redis
 
-local commands, network, request, response = {}, {}, {}, {}
+local unpack = _G.unpack or table.unpack
+local network, request, response = {}, {}, {}
 
 local defaults = {
     host        = '127.0.0.1',
     port        = 6379,
     tcp_nodelay = true,
     path        = nil
-}
-
-local protocol = {
-    newline = '\r\n',
-    ok      = 'OK',
-    err     = 'ERR',
-    queued  = 'QUEUED',
-    null    = 'nil'
 }
 
 local function merge_defaults(parameters)
@@ -52,11 +43,56 @@ end
 
 local function toboolean(value) return value == 1 end
 
-local function fire_and_forget(client, command)
-    -- let's fire and forget! the connection is closed as soon
-    -- as the SHUTDOWN command is received by the server.
-    client.network.write(client, command .. protocol.newline)
-    return false
+local function sort_request(client, command, key, params)
+    --[[ params = {
+        by    = 'weight_*',
+        get   = 'object_*',
+        limit = { 0, 10 },
+        sort  = 'desc',
+        alpha = true,
+    } ]]
+    local query = { key }
+
+    if params then
+        if params.by then
+            table.insert(query, 'BY')
+            table.insert(query, params.by)
+        end
+
+        if type(params.limit) == 'table' then
+            -- TODO: check for lower and upper limits
+            table.insert(query, 'LIMIT')
+            table.insert(query, params.limit[1])
+            table.insert(query, params.limit[2])
+        end
+
+        if params.get then
+            if (type(params.get) == 'table') then
+                for _, getarg in pairs(params.get) do
+                    table.insert(query, 'GET')
+                    table.insert(query, getarg)
+                end
+            else
+                table.insert(query, 'GET')
+                table.insert(query, params.get)
+            end
+        end
+
+        if params.sort then
+            table.insert(query, params.sort)
+        end
+
+        if params.alpha == true then
+            table.insert(query, 'ALPHA')
+        end
+
+        if params.store then
+            table.insert(query, 'STORE')
+            table.insert(query, params.store)
+        end
+    end
+
+    request.multibulk(client, command, query)
 end
 
 local function zset_range_request(client, command, ...)
@@ -184,15 +220,25 @@ local function parse_info(response)
     return info
 end
 
-local function load_methods(proto, methods)
+local function load_methods(proto, commands)
     local client = setmetatable ({}, getmetatable(proto))
-    for i, v in pairs(proto) do client[i] = v end
-    for i, v in pairs(methods) do client[i] = v end
+
+    for cmd, fn in pairs(commands) do
+        if type(fn) ~= 'function' then
+            redis.error('invalid type for command ' .. cmd .. '(must be a function)')
+        end
+        client[cmd] = fn
+    end
+
+    for i, v in pairs(proto) do
+        client[i] = v
+    end
+
     return client
 end
 
-local function create_client(proto, client_socket, methods)
-    local client = load_methods(proto, methods)
+local function create_client(proto, client_socket, commands)
+    local client = load_methods(proto, commands)
     client.error = redis.error
     client.network = {
         socket = client_socket,
@@ -221,87 +267,74 @@ end
 -- ############################################################################
 
 function response.read(client)
-    local res = client.network.read(client)
-    local prefix  = res:sub(1, -#res)
-    local handler = protocol.prefixes[prefix]
-    if not handler then
-        client.error('unknown response prefix: '..prefix)
-    end
-    return handler(client, res)
-end
+    local payload = client.network.read(client)
+    local prefix, data = payload:sub(1, -#payload), payload:sub(2)
 
-function response.status(client, data)
-    local sub = data:sub(2)
+    -- status reply
+    if prefix == '+' then
+        if data == 'OK' then
+            return true
+        elseif data == 'QUEUED' then
+            return { queued = true }
+        else
+            return data
+        end
 
-    if sub == protocol.ok then
-        return true
-    elseif sub == protocol.queued then
-        return { queued = true }
-    else
-        return sub
-    end
-end
+   -- error reply
+    elseif prefix == '-' then
+        return client.error('redis error: ' .. data)
 
-function response.error(client, data)
-    local err_line = data:sub(2)
+   -- integer reply
+    elseif prefix == ':' then
+        local number = tonumber(data)
 
-    if err_line:sub(1, 3) == protocol.err then
-        client.error('redis error: ' .. err_line:sub(5))
-    else
-        client.error('redis error: ' .. err_line)
-    end
-end
+        if not number then
+            if res == 'nil' then
+                return nil
+            end
+            client.error('cannot parse '..res..' as a numeric response.')
+        end
 
-function response.bulk(client, data)
-    local str = data:sub(2)
-    local len = tonumber(str)
-    if not len then
-        client.error('cannot parse ' .. str .. ' as data length')
-    end
+        return number
 
-    if len == -1 then return nil end
-    local next_chunk = client.network.read(client, len + 2)
-    return next_chunk:sub(1, -3);
-end
+   -- bulk reply
+    elseif prefix == '$' then
+        local length = tonumber(data)
 
-function response.multibulk(client, data)
-    local str = data:sub(2)
-    local list_count = tonumber(str)
+        if not length then
+            client.error('cannot parse ' .. length .. ' as data length')
+        end
 
-    if list_count == -1 then
-        return nil
-    else
+        if length == -1 then
+            return nil
+        end
+
+        local nextchunk = client.network.read(client, length + 2)
+
+        return nextchunk:sub(1, -3)
+
+   -- multibulk reply
+    elseif prefix == '*' then
+        local count = tonumber(data)
+
+        if count == -1 then
+            return nil
+        end
+
         local list = {}
-        if list_count > 0 then
-            for i = 1, list_count do
-                table.insert(list, i, response.read(client))
+        if count > 0 then
+            local reader = response.read
+            for i = 1, count do
+                list[i] = reader(client)
             end
         end
         return list
+
+   -- unknown type of reply
+    else
+        return client.error('unknown response prefix: ' .. prefix)
     end
 end
-
-function response.integer(client, data)
-    local res = data:sub(2)
-    local number = tonumber(res)
-
-    if not number then
-        if res == protocol.null then
-            return nil
-        end
-        client.error('cannot parse '..res..' as a numeric response.')
-    end
-
-    return number
-end
-
-protocol.prefixes = {
-    ['+'] = response.status,
-    ['-'] = response.error,
-    ['$'] = response.bulk,
-    ['*'] = response.multibulk,
-    [':'] = response.integer,
-}
 
 -- ############################################################################
 
@@ -318,32 +351,32 @@ function request.raw(client, buffer)
 end
 
 function request.multibulk(client, command, ...)
-    local args      = {...}
-    local args_len  = #args
-    local buffer    = { true, true }
-    local proto_nl  = protocol.newline
+    local args = {...}
+    local argsn = #args
+    local buffer = { true, true }
 
-    if args_len == 1 and type(args[1]) == 'table' then
-        args_len, args = #args[1], args[1]
+    if argsn == 1 and type(args[1]) == 'table' then
+        argsn, args = #args[1], args[1]
     end
 
-    buffer[1] = '*' .. tostring(args_len + 1) .. proto_nl
-    buffer[2] = '$' .. #command .. proto_nl .. command .. proto_nl
+    buffer[1] = '*' .. tostring(argsn + 1) .. "\r\n"
+    buffer[2] = '$' .. #command .. "\r\n" .. command .. "\r\n"
 
+    local table_insert = table.insert
     for _, argument in pairs(args) do
-        s_argument = tostring(argument)
-        table.insert(buffer, '$' .. #s_argument .. proto_nl .. s_argument .. proto_nl)
+        local s_argument = tostring(argument)
+        table_insert(buffer, '$' .. #s_argument .. "\r\n" .. s_argument .. "\r\n")
     end
 
-    request.raw(client, buffer)
+    client.network.write(client, table.concat(buffer))
 end
 
 -- ############################################################################
 
 local function custom(command, send, parse)
+    command = string.upper(command)
     return function(client, ...)
-        local has_reply = send(client, command, ...)
-        if has_reply == false then return end
+        send(client, command, ...)
         local reply = response.read(client)
 
         if type(reply) == 'table' and reply.queued then
@@ -352,14 +385,13 @@ local function custom(command, send, parse)
         else
             if parse then
                 return parse(reply, command, ...)
-            else
-                return reply
             end
+            return reply
         end
     end
 end
 
-function command(command, opts)
+local function command(command, opts)
     if opts == nil or type(opts) == 'function' then
         return custom(command, request.multibulk, opts)
     else
@@ -385,26 +417,40 @@ end
 local client_prototype = {}
 
 client_prototype.raw_cmd = function(client, buffer)
-    request.raw(client, buffer .. protocol.newline)
+    request.raw(client, buffer .. "\r\n")
     return response.read(client)
 end
 
+-- obsolete
 client_prototype.define_command = function(client, name, opts)
     define_command_impl(client, name, opts)
 end
 
+-- obsolete
 client_prototype.undefine_command = function(client, name)
     undefine_command_impl(client, name)
+end
+
+client_prototype.quit = function(client)
+    request.multibulk(client, 'QUIT')
+    client.network.socket:shutdown()
+    return true
+end
+
+client_prototype.shutdown = function(client)
+    request.multibulk(client, 'SHUTDOWN')
+    client.network.socket:shutdown()
 end
 
 -- Command pipelining
 
 client_prototype.pipeline = function(client, block)
     local requests, replies, parsers = {}, {}, {}
+    local table_insert = table.insert
     local socket_write, socket_read = client.network.write, client.network.read
 
     client.network.write = function(_, buffer)
-        table.insert(requests, buffer)
+        table_insert(requests, buffer)
     end
 
     -- TODO: this hack is necessary to temporarily reuse the current
@@ -422,7 +468,7 @@ client_prototype.pipeline = function(client, block)
             end
             return function(self, ...)
                 local reply = cmd(client, ...)
-                table.insert(parsers, #requests, reply.parser)
+                table_insert(parsers, #requests, reply.parser)
                 return reply
             end
         end
@@ -440,7 +486,7 @@ client_prototype.pipeline = function(client, block)
         if parser then
             reply = parser(reply)
         end
-        table.insert(replies, i, reply)
+        table_insert(replies, i, reply)
     end
 
     return replies, #requests
@@ -535,12 +581,13 @@ do
     local emptytable = {}
 
     local function initialize_transaction(client, options, block, queued_parsers)
+        local table_insert = table.insert
         local coro = coroutine.create(block)
 
         if options.watch then
             local watch_keys = {}
             for _, key in pairs(options.watch) do
-                table.insert(watch_keys, key)
+                table_insert(watch_keys, key)
             end
             if #watch_keys > 0 then
                 client:watch(unpack(watch_keys))
@@ -578,7 +625,7 @@ do
                     local function queuey(self, ...)
                         local reply = cmd(client, ...)
                         assert((reply or emptytable).queued == true, 'a QUEUED reply was expected')
-                        table.insert(queued_parsers, reply.parser or identity)
+                        table_insert(queued_parsers, reply.parser or identity)
                         return reply
                     end
                     t[k]=queuey
@@ -620,8 +667,9 @@ do
             end
         end
 
+        local table_insert = table.insert
         for i, parser in pairs(queued_parsers) do
-            table.insert(replies, i, parser(raw_replies[i]))
+            table_insert(replies, i, parser(raw_replies[i]))
         end
 
         return replies, #queued_parsers
@@ -728,6 +776,10 @@ local function connect_unix(socket, parameters)
 end
 
 local function create_connection(parameters)
+    if parameters.socket then
+        return parameters.socket
+    end
+
     local perform_connection, socket
 
     if parameters.scheme == 'unix' then
@@ -776,6 +828,11 @@ function redis.connect(...)
         parameters = { host = host, port = port }
     end
 
+    local commands = redis.commands or {}
+    if type(commands) ~= 'table' then
+        redis.error('invalid type for the commands table')
+    end
+
     local socket = create_connection(merge_defaults(parameters))
     local client = create_client(client_prototype, socket, commands)
 
@@ -786,17 +843,22 @@ function redis.command(cmd, opts)
     return command(cmd, opts)
 end
 
+-- obsolete
 function redis.define_command(name, opts)
-    define_command_impl(commands, name, opts)
+    define_command_impl(redis.commands, name, opts)
 end
 
+-- obsolete
 function redis.undefine_command(name)
-    undefine_command_impl(commands, name)
+    undefine_command_impl(redis.commands, name)
 end
 
 -- ############################################################################
 
-commands = {
+-- Commands defined in this table do not take the precedence over
+-- methods defined in the client prototype table.
+
+redis.commands = {
     -- commands operating on the key space
     exists           = command('EXISTS', {
         response = toboolean
@@ -851,57 +913,7 @@ commands = {
         end
     }),
     sort             = command('SORT', {
-        request = function(client, command, key, params)
-            --[[ params = {
-                    by    = 'weight_*',
-                    get   = 'object_*',
-                    limit = { 0, 10 },
-                    sort  = 'desc',
-                    alpha = true,
-                } --]]
-            local query = { key }
-
-            if params then
-                if params.by then
-                    table.insert(query, 'BY')
-                    table.insert(query, params.by)
-                end
-
-                if type(params.limit) == 'table' then
-                    -- TODO: check for lower and upper limits
-                    table.insert(query, 'LIMIT')
-                    table.insert(query, params.limit[1])
-                    table.insert(query, params.limit[2])
-                end
-
-                if params.get then
-                    if (type(params.get) == 'table') then
-                        for _, getarg in pairs(params.get) do
-                            table.insert(query, 'GET')
-                            table.insert(query, getarg)
-                        end
-                    else
-                        table.insert(query, 'GET')
-                        table.insert(query, params.get)
-                    end
-                end
-
-                if params.sort then
-                    table.insert(query, params.sort)
-                end
-
-                if params.alpha == true then
-                    table.insert(query, 'ALPHA')
-                end
-
-                if params.store then
-                    table.insert(query, 'STORE')
-                    table.insert(query, params.store)
-                end
-            end
-
-            request.multibulk(client, command, query)
-        end
+        request = sort_request,
     }),
 
     -- commands operating on string values
@@ -1058,9 +1070,6 @@ commands = {
     echo             = command('ECHO'),
     auth             = command('AUTH'),
     select           = command('SELECT'),
-    quit             = command('QUIT', {
-        request = fire_and_forget
-    }),
 
     -- transactions
     multi            = command('MULTI'),        -- >= 2.0
@@ -1103,9 +1112,6 @@ commands = {
     flushall         = command('FLUSHALL'),
     monitor          = command('MONITOR'),
     time             = command('TIME'),         -- >= 2.6
-    shutdown         = command('SHUTDOWN', {
-        request = fire_and_forget
-    }),
     slowlog          = command('SLOWLOG', {     -- >= 2.2.13
         response = function(reply, command, ...)
             if (type(reply) == 'table') then

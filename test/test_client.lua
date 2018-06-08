@@ -1,7 +1,10 @@
-package.path = package.path .. ";../src/?.lua;src/?.lua"
+package.path = "../src/?.lua;src/?.lua;" .. package.path
 
-require "luarocks.require"
-require "telescope"
+pcall(require, "luarocks.require")
+
+local unpack = _G.unpack or table.unpack
+
+local tsc = require "telescope"
 local redis = require "redis"
 
 local settings = {
@@ -200,15 +203,15 @@ local shared = {
     end,
 }
 
-make_assertion("table_values", "'%s' to have the same values as '%s'", table.compare)
-make_assertion("response_queued", "to be queued", function(response)
+tsc.make_assertion("table_values", "'%s' to have the same values as '%s'", table.compare)
+tsc.make_assertion("response_queued", "to be queued", function(response)
     if type(response) == 'table' and response.queued == true then
         return true
     else
         return false
     end
 end)
-make_assertion("error_message", "result to be an error with the expected message", function(msg, f)
+tsc.make_assertion("error_message", "result to be an error with the expected message", function(msg, f)
     local ok, err = pcall(f)
     return not ok and err:match(msg)
 end)
@@ -241,6 +244,15 @@ context("Client initialization", function()
         local client = redis.connect(settings)
         assert_type(client, 'table')
     end)
+
+    test("Can use an already connected socket", function()
+        local connection = require('socket').tcp()
+        connection:connect(settings.host, settings.port)
+
+        local client = redis.connect({ socket = connection })
+        assert_type(client, 'table')
+        assert_true(client:ping())
+    end)
 end)
 
 context("Client features", function()
@@ -266,6 +278,18 @@ context("Client features", function()
     end)
 
     test("Define commands at module level", function()
+        redis.commands.doesnotexist = redis.command('doesnotexist')
+        local client2 = utils.create_client(settings)
+
+        redis.commands.doesnotexist = nil
+        local client3 = utils.create_client(settings)
+
+        assert_nil(client.doesnotexist)
+        assert_not_nil(client2.doesnotexist)
+        assert_nil(client3.doesnotexist)
+    end)
+
+    test("Define commands at module level (OLD)", function()
         redis.define_command('doesnotexist')
         local client2 = utils.create_client(settings)
 
@@ -278,6 +302,32 @@ context("Client features", function()
     end)
 
     test("Define new commands at client instance level", function()
+        client.doesnotexist = redis.command('doesnotexist')
+        assert_not_nil(client.doesnotexist)
+        assert_error(function() client:doesnotexist() end)
+
+        client.doesnotexist = nil
+        assert_nil(client.doesnotexist)
+
+        client.ping = redis.command('ping')
+        assert_not_nil(client.ping)
+        assert_equal(client:ping(), 'PONG')
+
+        client.ping = redis.command('ping', {
+            request = client.requests.multibulk
+        })
+        assert_not_nil(client.ping)
+        assert_equal(client:ping(), 'PONG')
+
+        client.ping = redis.command('ping', {
+            request  = client.requests.multibulk,
+            response = function(reply) return reply == 'PONG' end
+        })
+        assert_not_nil(client.ping)
+        assert_true(client:ping())
+    end)
+
+    test("Define new commands at client instance level (OLD)", function()
         client:define_command('doesnotexist')
         assert_not_nil(client.doesnotexist)
         assert_error(function() client:doesnotexist() end)
