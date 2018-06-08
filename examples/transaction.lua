@@ -10,7 +10,12 @@ local params = {
 local redis = Redis.connect(params)
 redis:select(15) -- for testing purposes
 
-redis:set('foo', 'bar')
-local value = redis:get('foo')
+local replies = redis:transaction(function(t)
+    t:incrby('counter', 10)
+    t:incrby('counter', 30)
+    t:decrby('counter', 15)
+end)
 
-print(value)
+for _, reply in pairs(replies) do
+    print('*', reply)
+end

@@ -1,8 +1,9 @@
 package = "redis-lua"
-version = "scm-1"
+version = "1.0.1-0"
 
 source = {
-   url = "git://github.com/nrk/redis-lua.git"
+   url = "http://cloud.github.com/downloads/nrk/redis-lua/redis-lua-1.0.1-0.tar.gz",
+   md5 = "0e00178a8bc7d68d463007eec49117d5"
 }
 
 description = {
@@ -23,7 +24,7 @@ build = {
    type = "none",
    install = {
       lua = {
-         redis = "src/redis.lua"
+         "redis.lua"
       }
    }
 }
