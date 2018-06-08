@@ -1,12 +1,14 @@
 module('Redis', package.seeall)
 
-local socket = require('socket')
-local uri    = require('socket.url')
+local commands, network, request, response = {}, {}, {}, {}
 
-local commands = {}
-local network, request, response = {}, {}, {}
+local defaults = {
+    host        = '127.0.0.1',
+    port        = 6379,
+    tcp_nodelay = true,
+    path        = nil
+}
 
-local defaults = { host = '127.0.0.1', port = 6379, tcp_nodelay = true }
 local protocol = {
     newline = '\r\n',
     ok      = 'OK',
@@ -14,6 +16,23 @@ local protocol = {
     queued  = 'QUEUED',
     null    = 'nil'
 }
+
+local lua_error = error
+error = function(message, level)
+    lua_error(message, (level or 1) + 1)
+end
+
+local function merge_defaults(parameters)
+    if parameters == nil then
+        parameters = {}
+    end
+    for k, v in pairs(defaults) do
+        if parameters[k] == nil then
+            parameters[k] = defaults[k]
+        end
+    end
+    return parameters
+end
 
 local function parse_boolean(v)
     if v == '1' or v == 'true' or v == 'TRUE' then
@@ -168,7 +187,10 @@ end
 function response.read(client)
     local res = client.network.read(client)
     local prefix  = res:sub(1, -#res)
-    local handler = assert(protocol.prefixes[prefix], 'unknown response prefix: '..prefix)
+    local handler = protocol.prefixes[prefix]
+    if not handler then
+        error('unknown response prefix: '..prefix)
+    end
     return handler(client, res)
 end
 
@@ -197,7 +219,9 @@ end
 function response.bulk(client, data)
     local str = data:sub(2)
     local len = tonumber(str)
-    assert(len, 'cannot parse ' .. str .. ' as data length')
+    if not len then
+        error('cannot parse ' .. str .. ' as data length')
+    end
 
     if len == -1 then return nil end
     local next_chunk = client.network.read(client, len + 2)
@@ -226,8 +250,10 @@ function response.integer(client, data)
     local number = tonumber(res)
 
     if not number then
-        assert(res == protocol.null, 'cannot parse ' .. res .. ' as numeric response.')
-        return nil
+        if res == protocol.null then
+            return nil
+        end
+        error('cannot parse '..res..' as a numeric response.')
     end
 
     return number
@@ -343,10 +369,11 @@ client_prototype.undefine_command = function(client, name)
     undefine_command_impl(client, name)
 end
 
+-- Command pipelining
+
 client_prototype.pipeline = function(client, block)
-    local simulate_queued = '+' .. protocol.queued
     local requests, replies, parsers = {}, {}, {}
-    local __netwrite, __netread = client.network.write, client.network.read
+    local socket_write, socket_read = client.network.write, client.network.read
 
     client.network.write = function(_, buffer)
         table.insert(requests, buffer)
@@ -357,9 +384,7 @@ client_prototype.pipeline = function(client, block)
     --       without further changes in the code, but it will surely
     --       disappear when the new command-definition infrastructure
     --       will finally be in place.
-    client.network.read = function()
-        return simulate_queued
-    end
+    client.network.read = function() return '+QUEUED' end
 
     local pipeline = setmetatable({}, {
         __index = function(env, name)
@@ -377,22 +402,105 @@ client_prototype.pipeline = function(client, block)
 
     local success, retval = pcall(block, pipeline)
 
-    client.network.write, client.network.read = __netwrite, __netread
+    client.network.write, client.network.read = socket_write, socket_read
     if not success then error(retval, 0) end
 
     client.network.write(client, table.concat(requests, ''))
 
     for i = 1, #requests do
-        local raw_reply, parser = response.read(client), parsers[i]
+        local reply, parser = response.read(client), parsers[i]
         if parser then
-            table.insert(replies, i, parser(raw_reply))
-        else
-            table.insert(replies, i, raw_reply)
+            reply = parser(reply)
         end
+        table.insert(replies, i, reply)
     end
 
     return replies, #requests
 end
+
+-- Publish/Subscribe
+
+do
+    local channels = function(channels)
+        if type(channels) == 'string' then
+            channels = { channels }
+        end
+        return channels
+    end
+
+    local subscribe = function(client, ...)
+        request.multibulk(client, 'subscribe', ...)
+    end
+    local psubscribe = function(client, ...)
+        request.multibulk(client, 'psubscribe', ...)
+    end
+    local unsubscribe = function(client, ...)
+        request.multibulk(client, 'unsubscribe')
+    end
+    local punsubscribe = function(client, ...)
+        request.multibulk(client, 'punsubscribe')
+    end
+
+    local consumer_loop = function(client)
+        local aborting, subscriptions = false, 0
+
+        local abort = function()
+            if not aborting then
+                unsubscribe(client)
+                punsubscribe(client)
+                aborting = true
+            end
+        end
+
+        return coroutine.wrap(function()
+            while true do
+                local message
+                local response = response.read(client)
+
+                if response[1] == 'pmessage' then
+                    message = {
+                        kind    = response[1],
+                        pattern = response[2],
+                        channel = response[3],
+                        payload = response[4],
+                    }
+                else
+                    message = {
+                        kind    = response[1],
+                        channel = response[2],
+                        payload = response[3],
+                    }
+                end
+
+                if string.match(message.kind, '^p?subscribe$') then
+                    subscriptions = subscriptions + 1
+                end
+                if string.match(message.kind, '^p?unsubscribe$') then
+                    subscriptions = subscriptions - 1
+                end
+
+                if aborting and subscriptions == 0 then
+                    break
+                end
+                coroutine.yield(message, abort)
+            end
+        end)
+    end
+
+    client_prototype.pubsub = function(client, subscriptions)
+        if type(subscriptions) == 'table' then
+            if subscriptions.subscribe then
+                subscribe(client, channels(subscriptions.subscribe))
+            end
+            if subscriptions.psubscribe then
+                psubscribe(client, channels(subscriptions.psubscribe))
+            end
+        end
+        return consumer_loop(client)
+    end
+end
+
+-- Redis transactions (MULTI/EXEC)
 
 do
     local function identity(...) return ... end
@@ -528,111 +636,114 @@ end
 
 -- ############################################################################
 
+local function connect_tcp(socket, parameters)
+    local host, port = parameters.host, tonumber(parameters.port)
+    local ok, err = socket:connect(host, port)
+    if not ok then
+        error('could not connect to '..host..':'..port..' ['..err..']')
+    end
+    socket:setoption('tcp-nodelay', parameters.tcp_nodelay)
+    return socket
+end
+
+local function connect_unix(socket, parameters)
+    local ok, err = socket:connect(parameters.path)
+    if not ok then
+        error('could not connect to '..parameters.path..' ['..err..']')
+    end
+    return socket
+end
+
+local function create_connection(parameters)
+    local perform_connection, socket
+
+    if parameters.scheme == 'unix' then
+        perform_connection, socket = connect_unix, require('socket.unix')
+        assert(socket, 'your build of LuaSocket does not support UNIX domain sockets')
+    else
+        if parameters.scheme then
+            local scheme = parameters.scheme
+            assert(scheme == 'redis' or scheme == 'tcp', 'invalid scheme: '..scheme)
+        end
+        perform_connection, socket = connect_tcp, require('socket').tcp
+    end
+
+    return perform_connection(socket(), parameters)
+end
+
 function connect(...)
-    local args = {...}
-    local host, port = defaults.host, defaults.port
-    local tcp_nodelay = defaults.tcp_nodelay
+    local args, parameters = {...}, nil
 
     if #args == 1 then
         if type(args[1]) == 'table' then
-            host = args[1].host or defaults.host
-            port = args[1].port or defaults.port
-            if args[1].tcp_nodelay ~= nil then
-                tcp_nodelay = args[1].tcp_nodelay == true
-            end
+            parameters = args[1]
         else
-            local server = uri.parse(select(1, ...))
-            if server.scheme then
-                assert(server.scheme == 'redis', '"'..server.scheme..'" is an invalid scheme')
-                host, port = server.host, server.port or defaults.port
-                if server.query then
-                    for k,v in server.query:gmatch('([-_%w]+)=([-_%w]+)') do
+            local uri = require('socket.url')
+            parameters = uri.parse(select(1, ...))
+            if parameters.scheme then
+                if parameters.query then
+                    for k, v in parameters.query:gmatch('([-_%w]+)=([-_%w]+)') do
                         if k == 'tcp_nodelay' or k == 'tcp-nodelay' then
-                            tcp_nodelay = parse_boolean(v)
-                            if tcp_nodelay == nil then
-                                tcp_nodelay = defaults.tcp_nodelay
-                            end
+                            parameters.tcp_nodelay = parse_boolean(v)
                         end
                     end
                 end
             else
-                host, port = server.path, defaults.port
+                parameters.host = parameters.path
             end
         end
     elseif #args > 1 then
-        host, port = unpack(args)
+        local host, port = unpack(args)
+        parameters = { host = host, port = port }
     end
 
-    assert(host, 'please specify the address of running redis instance')
-    local client_socket = socket.connect(host, tonumber(port))
-    assert(client_socket, 'could not connect to ' .. host .. ':' .. port)
-    client_socket:setoption('tcp-nodelay', tcp_nodelay)
+    local socket = create_connection(merge_defaults(parameters))
+    local client = create_client(client_prototype, socket, commands)
 
-    return create_client(client_prototype, client_socket, commands)
+    return client
 end
 
 -- ############################################################################
 
 commands = {
-    -- miscellaneous commands
-    ping       = command('PING', {
-        response = function(response) return response == 'PONG' end
-    }),
-    echo       = command('ECHO'),
-    auth       = command('AUTH'),
-
-    -- connection handling
-    quit       = command('QUIT', { request = fire_and_forget }),
-
-    -- transactions
-    multi      = command('MULTI'),
-    exec       = command('EXEC'),
-    discard    = command('DISCARD'),
-    watch      = command('WATCH'),          -- >= 2.2
-    unwatch    = command('UNWATCH'),        -- >= 2.2
-
-    -- commands operating on string values
-    set        = command('SET'),
-    setnx      = command('SETNX', { response = toboolean }),
-    setex      = command('SETEX'),          -- >= 2.0
-    mset       = command('MSET', { request = mset_filter_args }),
-    msetnx     = command('MSETNX', {
-        request  = mset_filter_args,
+    -- commands operating on the key space
+    exists           = command('EXISTS', {
         response = toboolean
     }),
-    get        = command('GET'),
-    mget       = command('MGET'),
-    getset     = command('GETSET'),
-    incr       = command('INCR'),
-    incrby     = command('INCRBY'),
-    decr       = command('DECR'),
-    decrby     = command('DECRBY'),
-    exists     = command('EXISTS', { response = toboolean }),
-    del        = command('DEL'),
-    type       = command('TYPE'),
-    append     = command('APPEND'),         -- >= 2.0
-    substr     = command('SUBSTR'),         -- >= 2.0
-    strlen     = command('STRLEN'),         -- >= 2.2
-    setrange   = command('SETRANGE'),       -- >= 2.2
-    getrange   = command('GETRANGE'),       -- >= 2.2
-    setbit     = command('SETBIT'),         -- >= 2.2
-    getbit     = command('GETBIT'),         -- >= 2.2
-
-    -- commands operating on the key space
-    keys       = command('KEYS', {
+    del              = command('DEL'),
+    type             = command('TYPE'),
+    rename           = command('RENAME'),
+    renamenx         = command('RENAMENX', {
+        response = toboolean
+    }),
+    expire           = command('EXPIRE', {
+        response = toboolean
+    }),
+    expireat         = command('EXPIREAT', {
+        response = toboolean
+    }),
+    ttl              = command('TTL'),
+    move             = command('MOVE', {
+        response = toboolean
+    }),
+    dbsize           = command('DBSIZE'),
+    persist          = command('PERSIST', {     -- >= 2.2
+        response = toboolean
+    }),
+    keys             = command('KEYS', {
         response = function(response)
-            if type(response) == 'table' then
-                return response
-            else
+            if type(response) == 'string' then
+                -- backwards compatibility path for Redis < 2.0
                 local keys = {}
                 response:gsub('[^%s]+', function(key)
                     table.insert(keys, key)
                 end)
-                return keys
+                response = keys
             end
+            return response
         end
     }),
-    randomkey  = command('RANDOMKEY', {
+    randomkey        = command('RANDOMKEY', {
         response = function(response)
             if response == '' then
                 return nil
@@ -641,132 +752,15 @@ commands = {
             end
         end
     }),
-    rename    = command('RENAME'),
-    renamenx  = command('RENAMENX', { response = toboolean }),
-    expire    = command('EXPIRE', { response = toboolean }),
-    expireat  = command('EXPIREAT', { response = toboolean }),
-    dbsize    = command('DBSIZE'),
-    ttl       = command('TTL'),
-    persist   = command('PERSIST', { response = toboolean }),     -- >= 2.2
-
-    -- commands operating on lists
-    rpush            = command('RPUSH'),
-    lpush            = command('LPUSH'),
-    llen             = command('LLEN'),
-    lrange           = command('LRANGE'),
-    ltrim            = command('LTRIM'),
-    lindex           = command('LINDEX'),
-    lset             = command('LSET'),
-    lrem             = command('LREM'),
-    lpop             = command('LPOP'),
-    rpop             = command('RPOP'),
-    rpoplpush        = command('RPOPLPUSH'),
-    blpop            = command('BLPOP'),
-    brpop            = command('BRPOP'),
-    rpushx           = command('RPUSHX'),           -- >= 2.2
-    lpushx           = command('LPUSHX'),           -- >= 2.2
-    linsert          = command('LINSERT'),          -- >= 2.2
-    brpoplpush       = command('BRPOPLPUSH'),       -- >= 2.2
-
-    -- commands operating on sets
-    sadd             = command('SADD', { response = toboolean }),
-    srem             = command('SREM', { response = toboolean }),
-    spop             = command('SPOP'),
-    smove            = command('SMOVE', { response = toboolean }),
-    scard            = command('SCARD'),
-    sismember        = command('SISMEMBER', { response = toboolean }),
-    sinter           = command('SINTER'),
-    sinterstore      = command('SINTERSTORE'),
-    sunion           = command('SUNION'),
-    sunionstore      = command('SUNIONSTORE'),
-    sdiff            = command('SDIFF'),
-    sdiffstore       = command('SDIFFSTORE'),
-    smembers         = command('SMEMBERS'),
-    srandmember      = command('SRANDMEMBER'),
-
-    -- commands operating on sorted sets
-    zadd             = command('ZADD', { response = toboolean }),
-    zincrby          = command('ZINCRBY'),
-    zrem             = command('ZREM', { response = toboolean }),
-    zrange           = command('ZRANGE', {
-        request  = zset_range_request,
-        response = zset_range_reply,
-    }),
-    zrevrange        = command('ZREVRANGE', {
-        request  = zset_range_request,
-        response = zset_range_reply,
-    }),
-    zrangebyscore    = command('ZRANGEBYSCORE', {
-        request  = zset_range_byscore_request,
-        response = zset_range_reply,
-    }),
-    zrevrangebyscore = command('ZREVRANGEBYSCORE', {              -- >= 2.2
-        request  = zset_range_byscore_request,
-        response = zset_range_reply,
-    }),
-    zunionstore      = command('ZUNIONSTORE', { request = zset_store_request }),
-    zinterstore      = command('ZINTERSTORE', { request = zset_store_request }),
-    zcount           = command('ZCOUNT'),
-    zcard            = command('ZCARD'),
-    zscore           = command('ZSCORE'),
-    zremrangebyscore = command('ZREMRANGEBYSCORE'),
-    zrank            = command('ZRANK'),
-    zrevrank         = command('ZREVRANK'),
-    zremrangebyrank  = command('ZREMRANGEBYRANK'),
-
-    -- commands operating on hashes
-    hset             = command('HSET', { response = toboolean }),
-    hsetnx           = command('HSETNX', { response = toboolean }),
-    hmset            = command('HMSET', {
-        request  = hash_multi_request_builder(function(args, k, v)
-            table.insert(args, k)
-            table.insert(args, v)
-        end),
-    }),
-    hincrby          = command('HINCRBY'),
-    hget             = command('HGET'),
-    hmget            = command('HMGET', {
-        request  = hash_multi_request_builder(function(args, k, v)
-            table.insert(args, v)
-        end),
-    }),
-    hdel             = command('HDEL', { response = toboolean }),
-    hexists          = command('HEXISTS', { response = toboolean }),
-    hlen             = command('HLEN'),
-    hkeys            = command('HKEYS'),
-    hvals            = command('HVALS'),
-    hgetall          = command('HGETALL', {
-        response = function(reply, command, ...)
-            local new_reply = { }
-            for i = 1, #reply, 2 do new_reply[reply[i]] = reply[i + 1] end
-            return new_reply
-        end
-    }),
-
-    -- publish - subscribe
-    subscribe        = command('SUBSCRIBE'),
-    unsubscribe      = command('UNSUBSCRIBE'),
-    psubscribe       = command('PSUBSCRIBE'),
-    punsubscribe     = command('PUNSUBSCRIBE'),
-    publish          = command('PUBLISH'),
-
-    -- multiple databases handling commands
-    select           = command('SELECT'),
-    move             = command('MOVE', { response = toboolean }),
-    flushdb          = command('FLUSHDB'),
-    flushall         = command('FLUSHALL'),
-
-    -- sorting
-    --[[ params = {
-            by    = 'weight_*',
-            get   = 'object_*',
-            limit = { 0, 10 },
-            sort  = 'desc',
-            alpha = true,
-        }
-    --]]
     sort             = command('SORT', {
         request = function(client, command, key, params)
+            --[[ params = {
+                    by    = 'weight_*',
+                    get   = 'object_*',
+                    limit = { 0, 10 },
+                    sort  = 'desc',
+                    alpha = true,
+                } --]]
             local query = { key }
 
             if params then
@@ -812,14 +806,192 @@ commands = {
         end
     }),
 
-    -- persistence control commands
+    -- commands operating on string values
+    set              = command('SET'),
+    setnx            = command('SETNX', {
+        response = toboolean
+    }),
+    setex            = command('SETEX'),        -- >= 2.0
+    mset             = command('MSET', {
+        request = mset_filter_args
+    }),
+    msetnx           = command('MSETNX', {
+        request  = mset_filter_args,
+        response = toboolean
+    }),
+    get              = command('GET'),
+    mget             = command('MGET'),
+    getset           = command('GETSET'),
+    incr             = command('INCR'),
+    incrby           = command('INCRBY'),
+    decr             = command('DECR'),
+    decrby           = command('DECRBY'),
+    append           = command('APPEND'),       -- >= 2.0
+    substr           = command('SUBSTR'),       -- >= 2.0
+    strlen           = command('STRLEN'),       -- >= 2.2
+    setrange         = command('SETRANGE'),     -- >= 2.2
+    getrange         = command('GETRANGE'),     -- >= 2.2
+    setbit           = command('SETBIT'),       -- >= 2.2
+    getbit           = command('GETBIT'),       -- >= 2.2
+
+    -- commands operating on lists
+    rpush            = command('RPUSH'),
+    lpush            = command('LPUSH'),
+    llen             = command('LLEN'),
+    lrange           = command('LRANGE'),
+    ltrim            = command('LTRIM'),
+    lindex           = command('LINDEX'),
+    lset             = command('LSET'),
+    lrem             = command('LREM'),
+    lpop             = command('LPOP'),
+    rpop             = command('RPOP'),
+    rpoplpush        = command('RPOPLPUSH'),
+    blpop            = command('BLPOP'),        -- >= 2.0
+    brpop            = command('BRPOP'),        -- >= 2.0
+    rpushx           = command('RPUSHX'),       -- >= 2.2
+    lpushx           = command('LPUSHX'),       -- >= 2.2
+    linsert          = command('LINSERT'),      -- >= 2.2
+    brpoplpush       = command('BRPOPLPUSH'),   -- >= 2.2
+
+    -- commands operating on sets
+    sadd             = command('SADD', {
+        response = toboolean
+    }),
+    srem             = command('SREM', {
+        response = toboolean
+    }),
+    spop             = command('SPOP'),
+    smove            = command('SMOVE', {
+        response = toboolean
+    }),
+    scard            = command('SCARD'),
+    sismember        = command('SISMEMBER', {
+        response = toboolean
+    }),
+    sinter           = command('SINTER'),
+    sinterstore      = command('SINTERSTORE'),
+    sunion           = command('SUNION'),
+    sunionstore      = command('SUNIONSTORE'),
+    sdiff            = command('SDIFF'),
+    sdiffstore       = command('SDIFFSTORE'),
+    smembers         = command('SMEMBERS'),
+    srandmember      = command('SRANDMEMBER'),
+
+    -- commands operating on sorted sets
+    zadd             = command('ZADD', {
+        response = toboolean
+    }),
+    zincrby          = command('ZINCRBY'),
+    zrem             = command('ZREM', {
+        response = toboolean
+    }),
+    zrange           = command('ZRANGE', {
+        request  = zset_range_request,
+        response = zset_range_reply,
+    }),
+    zrevrange        = command('ZREVRANGE', {
+        request  = zset_range_request,
+        response = zset_range_reply,
+    }),
+    zrangebyscore    = command('ZRANGEBYSCORE', {
+        request  = zset_range_byscore_request,
+        response = zset_range_reply,
+    }),
+    zrevrangebyscore = command('ZREVRANGEBYSCORE', {    -- >= 2.2
+        request  = zset_range_byscore_request,
+        response = zset_range_reply,
+    }),
+    zunionstore      = command('ZUNIONSTORE', {         -- >= 2.0
+        request = zset_store_request
+    }),
+    zinterstore      = command('ZINTERSTORE', {         -- >= 2.0
+        request = zset_store_request
+    }),
+    zcount           = command('ZCOUNT'),
+    zcard            = command('ZCARD'),
+    zscore           = command('ZSCORE'),
+    zremrangebyscore = command('ZREMRANGEBYSCORE'),
+    zrank            = command('ZRANK'),                -- >= 2.0
+    zrevrank         = command('ZREVRANK'),             -- >= 2.0
+    zremrangebyrank  = command('ZREMRANGEBYRANK'),      -- >= 2.0
+
+    -- commands operating on hashes
+    hset             = command('HSET', {        -- >= 2.0
+        response = toboolean
+    }),
+    hsetnx           = command('HSETNX', {      -- >= 2.0
+        response = toboolean
+    }),
+    hmset            = command('HMSET', {       -- >= 2.0
+        request  = hash_multi_request_builder(function(args, k, v)
+            table.insert(args, k)
+            table.insert(args, v)
+        end),
+    }),
+    hincrby          = command('HINCRBY'),      -- >= 2.0
+    hget             = command('HGET'),         -- >= 2.0
+    hmget            = command('HMGET', {       -- >= 2.0
+        request  = hash_multi_request_builder(function(args, k, v)
+            table.insert(args, v)
+        end),
+    }),
+    hdel             = command('HDEL', {        -- >= 2.0
+        response = toboolean
+    }),
+    hexists          = command('HEXISTS', {     -- >= 2.0
+        response = toboolean
+    }),
+    hlen             = command('HLEN'),         -- >= 2.0
+    hkeys            = command('HKEYS'),        -- >= 2.0
+    hvals            = command('HVALS'),        -- >= 2.0
+    hgetall          = command('HGETALL', {     -- >= 2.0
+        response = function(reply, command, ...)
+            local new_reply = { }
+            for i = 1, #reply, 2 do new_reply[reply[i]] = reply[i + 1] end
+            return new_reply
+        end
+    }),
+
+    -- connection related commands
+    ping             = command('PING', {
+        response = function(response) return response == 'PONG' end
+    }),
+    echo             = command('ECHO'),
+    auth             = command('AUTH'),
+    select           = command('SELECT'),
+    quit             = command('QUIT', {
+        request = fire_and_forget
+    }),
+
+    -- transactions
+    multi            = command('MULTI'),        -- >= 2.0
+    exec             = command('EXEC'),         -- >= 2.0
+    discard          = command('DISCARD'),      -- >= 2.0
+    watch            = command('WATCH'),        -- >= 2.2
+    unwatch          = command('UNWATCH'),      -- >= 2.2
+
+    -- publish - subscribe
+    subscribe        = command('SUBSCRIBE'),    -- >= 2.0
+    unsubscribe      = command('UNSUBSCRIBE'),  -- >= 2.0
+    psubscribe       = command('PSUBSCRIBE'),   -- >= 2.0
+    punsubscribe     = command('PUNSUBSCRIBE'), -- >= 2.0
+    publish          = command('PUBLISH'),      -- >= 2.0
+
+    -- remote server control commands
+    bgrewriteaof     = command('BGREWRITEAOF'),
+    config           = command('CONFIG'),       -- >= 2.0
+    client           = command('CLIENT'),       -- >= 2.4
+    slaveof          = command('SLAVEOF'),
     save             = command('SAVE'),
     bgsave           = command('BGSAVE'),
     lastsave         = command('LASTSAVE'),
-    shutdown         = command('SHUTDOWN', { request = fire_and_forget }),
-    bgrewriteaof     = command('BGREWRITEAOF'),
-
-    -- remote server control commands
+    flushdb          = command('FLUSHDB'),
+    flushall         = command('FLUSHALL'),
+    eval             = command('EVAL'),         -- >= 2.6
+    evalsha          = command('EVALSHA'),      -- >= 2.6
+    shutdown         = command('SHUTDOWN', {
+        request = fire_and_forget
+    }),
     info             = command('INFO', {
         response = function(response)
             local info = {}
@@ -838,6 +1010,4 @@ commands = {
             return info
         end
     }),
-    slaveof          = command('SLAVEOF'),
-    config           = command('CONFIG'),
 }
