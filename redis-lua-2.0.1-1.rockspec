@@ -1,17 +1,17 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "redis-lua"
-version = "2.0.0-0"
+version = "2.0.1-1"
 
 -- LuaDist source
 source = {
-  tag = "2.0.0-0",
+  tag = "2.0.1-1",
   url = "git://github.com/LuaDist-testing/redis-lua.git"
 }
 -- Original source
 -- source = {
---    url = "http://cloud.github.com/downloads/nrk/redis-lua/redis-lua-2.0.0-0.tar.gz",
---    md5 = "db1f9a74d13158c1b551a4fa054a92ba"
+--    url = "http://cloud.github.com/downloads/nrk/redis-lua/redis-lua-2.0.1-0.tar.gz",
+--    md5 = "824c9bd4e98b919747c6f1f3be322196"
 -- }
 
 description = {
