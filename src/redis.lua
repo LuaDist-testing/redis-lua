@@ -1,4 +1,15 @@
-module('Redis', package.seeall)
+-- module('Redis')
+
+local redis = {
+    _VERSION     = 'redis-lua 2.0.3',
+    _DESCRIPTION = 'A Lua client library for the redis key value storage system.',
+    _COPYRIGHT   = 'Copyright (C) 2009-2012 Daniele Alessandri',
+}
+
+-- The following line is used for backwards compatibility in order to keep the `Redis`
+-- global module name. Using `Redis` is now deprecated so you should explicitly assign
+-- the module to a local variable when requiring it: `local redis = require('redis')`.
+Redis = redis
 
 local commands, network, request, response = {}, {}, {}, {}
 
@@ -16,11 +27,6 @@ local protocol = {
     queued  = 'QUEUED',
     null    = 'nil'
 }
-
-local lua_error = error
-error = function(message, level)
-    lua_error(message, (level or 1) + 1)
-end
 
 local function merge_defaults(parameters)
     if parameters == nil then
@@ -149,37 +155,67 @@ local function hash_multi_request_builder(builder_callback)
     end
 end
 
+local function parse_info(response)
+    local info = {}
+    local current = info
+
+    response:gsub('([^\r\n]*)\r\n', function(kv)
+        if kv == '' then return end
+
+        local section = kv:match('^# (%w+)$')
+        if section then
+            current = {}
+            info[section:lower()] = current
+            return
+        end
+
+        local k,v = kv:match(('([^:]*):([^:]*)'):rep(1))
+        if k:match('db%d+') then
+            current[k] = {}
+            v:gsub(',', function(dbkv)
+                local dbk,dbv = kv:match('([^:]*)=([^:]*)')
+                current[k][dbk] = dbv
+            end)
+        else
+            current[k] = v
+        end
+    end)
+
+    return info
+end
+
 local function load_methods(proto, methods)
-    local redis = setmetatable ({}, getmetatable(proto))
-    for i, v in pairs(proto) do redis[i] = v end
-    for i, v in pairs(methods) do redis[i] = v end
-    return redis
+    local client = setmetatable ({}, getmetatable(proto))
+    for i, v in pairs(proto) do client[i] = v end
+    for i, v in pairs(methods) do client[i] = v end
+    return client
 end
 
 local function create_client(proto, client_socket, methods)
-    local redis = load_methods(proto, methods)
-    redis.network = {
+    local client = load_methods(proto, methods)
+    client.error = redis.error
+    client.network = {
         socket = client_socket,
         read   = network.read,
         write  = network.write,
     }
-    redis.requests = {
+    client.requests = {
         multibulk = request.multibulk,
     }
-    return redis
+    return client
 end
 
 -- ############################################################################
 
 function network.write(client, buffer)
     local _, err = client.network.socket:send(buffer)
-    if err then error(err) end
+    if err then client.error(err) end
 end
 
 function network.read(client, len)
     if len == nil then len = '*l' end
     local line, err = client.network.socket:receive(len)
-    if not err then return line else error('connection error: ' .. err) end
+    if not err then return line else client.error('connection error: ' .. err) end
 end
 
 -- ############################################################################
@@ -189,7 +225,7 @@ function response.read(client)
     local prefix  = res:sub(1, -#res)
     local handler = protocol.prefixes[prefix]
     if not handler then
-        error('unknown response prefix: '..prefix)
+        client.error('unknown response prefix: '..prefix)
     end
     return handler(client, res)
 end
@@ -210,9 +246,9 @@ function response.error(client, data)
     local err_line = data:sub(2)
 
     if err_line:sub(1, 3) == protocol.err then
-        error('redis error: ' .. err_line:sub(5))
+        client.error('redis error: ' .. err_line:sub(5))
     else
-        error('redis error: ' .. err_line)
+        client.error('redis error: ' .. err_line)
     end
 end
 
@@ -220,7 +256,7 @@ function response.bulk(client, data)
     local str = data:sub(2)
     local len = tonumber(str)
     if not len then
-        error('cannot parse ' .. str .. ' as data length')
+        client.error('cannot parse ' .. str .. ' as data length')
     end
 
     if len == -1 then return nil end
@@ -253,7 +289,7 @@ function response.integer(client, data)
         if res == protocol.null then
             return nil
         end
-        error('cannot parse '..res..' as a numeric response.')
+        client.error('cannot parse '..res..' as a numeric response.')
     end
 
     return number
@@ -277,7 +313,7 @@ function request.raw(client, buffer)
     elseif bufferType == 'string' then
         client.network.write(client, buffer)
     else
-        error('argument error: ' .. bufferType)
+        client.error('argument error: ' .. bufferType)
     end
 end
 
@@ -340,16 +376,8 @@ local define_command_impl = function(target, name, opts)
     )
 end
 
-function define_command(name, opts)
-    define_command_impl(commands, name, opts)
-end
-
 local undefine_command_impl = function(target, name)
     target[string.lower(name)] = nil
-end
-
-function undefine_command(name)
-    undefine_command_impl(commands, name)
 end
 
 -- ############################################################################
@@ -390,7 +418,7 @@ client_prototype.pipeline = function(client, block)
         __index = function(env, name)
             local cmd = client[name]
             if not cmd then
-                error('unknown redis command: ' .. name, 2)
+                client.error('unknown redis command: ' .. name, 2)
             end
             return function(self, ...)
                 local reply = cmd(client, ...)
@@ -403,7 +431,7 @@ client_prototype.pipeline = function(client, block)
     local success, retval = pcall(block, pipeline)
 
     client.network.write, client.network.read = socket_write, socket_read
-    if not success then error(retval, 0) end
+    if not success then client.error(retval, 0) end
 
     client.network.write(client, table.concat(requests, ''))
 
@@ -521,7 +549,7 @@ do
 
         local transaction_client = setmetatable({}, {__index=client})
         transaction_client.exec  = function(...)
-            error('cannot use EXEC inside a transaction block')
+            client.error('cannot use EXEC inside a transaction block')
         end
         transaction_client.multi = function(...)
             coroutine.yield()
@@ -542,7 +570,7 @@ do
             return reply
         end
         transaction_client.watch = function(...)
-            error('WATCH inside MULTI is not allowed')
+            client.error('WATCH inside MULTI is not allowed')
         end
         setmetatable(transaction_client, { __index = function(t, k)
                 local cmd = client[k]
@@ -585,7 +613,7 @@ do
         local raw_replies = client:exec()
         if not raw_replies then
             if (retry or 0) <= 0 then
-                error("MULTI/EXEC transaction aborted by the server")
+                client.error("MULTI/EXEC transaction aborted by the server")
             else
                 --we're not quite done yet
                 return transaction(client, options, coroutine_block, retry - 1)
@@ -606,7 +634,7 @@ do
         elseif arg1 then --and arg2, implicitly
             options, block = type(arg1)=="table" and arg1 or { arg1 }, arg2
         else
-            error("Invalid parameters for redis transaction.")
+            client.error("Invalid parameters for redis transaction.")
         end
 
         if not options.watch then
@@ -634,13 +662,58 @@ do
     end
 end
 
+-- MONITOR context
+
+do
+    local monitor_loop = function(client)
+        local monitoring = true
+
+        -- Tricky since the payload format changed starting from Redis 2.6.
+        local pattern = '^(%d+%.%d+)( ?.- ?) ?"(%a+)" ?(.-)$'
+
+        local abort = function()
+            monitoring = false
+        end
+
+        return coroutine.wrap(function()
+            client:monitor()
+
+            while monitoring do
+                local message, matched
+                local response = response.read(client)
+
+                local ok = response:gsub(pattern, function(time, info, cmd, args)
+                    message = {
+                        timestamp = tonumber(time),
+                        client    = info:match('%d+.%d+.%d+.%d+:%d+'),
+                        database  = tonumber(info:match('%d+')) or 0,
+                        command   = cmd,
+                        arguments = args:match('.+'),
+                    }
+                    matched = true
+                end)
+
+                if not matched then
+                    client.error('Unable to match MONITOR payload: '..response)
+                end
+
+                coroutine.yield(message, abort)
+            end
+        end)
+    end
+
+    client_prototype.monitor_messages = function(client)
+        return monitor_loop(client)
+    end
+end
+
 -- ############################################################################
 
 local function connect_tcp(socket, parameters)
     local host, port = parameters.host, tonumber(parameters.port)
     local ok, err = socket:connect(host, port)
     if not ok then
-        error('could not connect to '..host..':'..port..' ['..err..']')
+        redis.error('could not connect to '..host..':'..port..' ['..err..']')
     end
     socket:setoption('tcp-nodelay', parameters.tcp_nodelay)
     return socket
@@ -649,7 +722,7 @@ end
 local function connect_unix(socket, parameters)
     local ok, err = socket:connect(parameters.path)
     if not ok then
-        error('could not connect to '..parameters.path..' ['..err..']')
+        redis.error('could not connect to '..parameters.path..' ['..err..']')
     end
     return socket
 end
@@ -671,7 +744,13 @@ local function create_connection(parameters)
     return perform_connection(socket(), parameters)
 end
 
-function connect(...)
+-- ############################################################################
+
+function redis.error(message, level)
+    error(message, (level or 1) + 1)
+end
+
+function redis.connect(...)
     local args, parameters = {...}, nil
 
     if #args == 1 then
@@ -703,6 +782,18 @@ function connect(...)
     return client
 end
 
+function redis.command(cmd, opts)
+    return command(cmd, opts)
+end
+
+function redis.define_command(name, opts)
+    define_command_impl(commands, name, opts)
+end
+
+function redis.undefine_command(name)
+    undefine_command_impl(commands, name)
+end
+
 -- ############################################################################
 
 commands = {
@@ -719,10 +810,17 @@ commands = {
     expire           = command('EXPIRE', {
         response = toboolean
     }),
+    pexpire          = command('PEXPIRE', {     -- >= 2.6
+        response = toboolean
+    }),
     expireat         = command('EXPIREAT', {
         response = toboolean
     }),
+    pexpireat        = command('PEXPIREAT', {   -- >= 2.6
+        response = toboolean
+    }),
     ttl              = command('TTL'),
+    pttl             = command('PTTL'),         -- >= 2.6
     move             = command('MOVE', {
         response = toboolean
     }),
@@ -812,6 +910,7 @@ commands = {
         response = toboolean
     }),
     setex            = command('SETEX'),        -- >= 2.0
+    psetex           = command('PSETEX'),       -- >= 2.6
     mset             = command('MSET', {
         request = mset_filter_args
     }),
@@ -824,6 +923,11 @@ commands = {
     getset           = command('GETSET'),
     incr             = command('INCR'),
     incrby           = command('INCRBY'),
+    incrbyfloat      = command('INCRBYFLOAT', { -- >= 2.6
+        response = function(reply, command, ...)
+            return tonumber(reply)
+        end,
+    }),
     decr             = command('DECR'),
     decrby           = command('DECRBY'),
     append           = command('APPEND'),       -- >= 2.0
@@ -854,12 +958,8 @@ commands = {
     brpoplpush       = command('BRPOPLPUSH'),   -- >= 2.2
 
     -- commands operating on sets
-    sadd             = command('SADD', {
-        response = toboolean
-    }),
-    srem             = command('SREM', {
-        response = toboolean
-    }),
+    sadd             = command('SADD'),
+    srem             = command('SREM'),
     spop             = command('SPOP'),
     smove            = command('SMOVE', {
         response = toboolean
@@ -878,13 +978,9 @@ commands = {
     srandmember      = command('SRANDMEMBER'),
 
     -- commands operating on sorted sets
-    zadd             = command('ZADD', {
-        response = toboolean
-    }),
+    zadd             = command('ZADD'),
     zincrby          = command('ZINCRBY'),
-    zrem             = command('ZREM', {
-        response = toboolean
-    }),
+    zrem             = command('ZREM'),
     zrange           = command('ZRANGE', {
         request  = zset_range_request,
         response = zset_range_reply,
@@ -929,15 +1025,18 @@ commands = {
         end),
     }),
     hincrby          = command('HINCRBY'),      -- >= 2.0
+    hincrbyfloat     = command('HINCRBYFLOAT', {-- >= 2.6
+        response = function(reply, command, ...)
+            return tonumber(reply)
+        end,
+    }),
     hget             = command('HGET'),         -- >= 2.0
     hmget            = command('HMGET', {       -- >= 2.0
         request  = hash_multi_request_builder(function(args, k, v)
             table.insert(args, v)
         end),
     }),
-    hdel             = command('HDEL', {        -- >= 2.0
-        response = toboolean
-    }),
+    hdel             = command('HDEL'),        -- >= 2.0
     hexists          = command('HEXISTS', {     -- >= 2.0
         response = toboolean
     }),
@@ -977,9 +1076,24 @@ commands = {
     punsubscribe     = command('PUNSUBSCRIBE'), -- >= 2.0
     publish          = command('PUBLISH'),      -- >= 2.0
 
+    -- redis scripting
+    eval             = command('EVAL'),         -- >= 2.6
+    evalsha          = command('EVALSHA'),      -- >= 2.6
+    script           = command('SCRIPT'),       -- >= 2.6
+
     -- remote server control commands
     bgrewriteaof     = command('BGREWRITEAOF'),
-    config           = command('CONFIG'),       -- >= 2.0
+    config           = command('CONFIG', {     -- >= 2.0
+        response = function(reply, command, ...)
+            if (type(reply) == 'table') then
+                local new_reply = { }
+                for i = 1, #reply, 2 do new_reply[reply[i]] = reply[i + 1] end
+                return new_reply
+            end
+
+            return reply
+        end
+    }),
     client           = command('CLIENT'),       -- >= 2.4
     slaveof          = command('SLAVEOF'),
     save             = command('SAVE'),
@@ -987,27 +1101,34 @@ commands = {
     lastsave         = command('LASTSAVE'),
     flushdb          = command('FLUSHDB'),
     flushall         = command('FLUSHALL'),
-    eval             = command('EVAL'),         -- >= 2.6
-    evalsha          = command('EVALSHA'),      -- >= 2.6
+    monitor          = command('MONITOR'),
+    time             = command('TIME'),         -- >= 2.6
     shutdown         = command('SHUTDOWN', {
         request = fire_and_forget
     }),
-    info             = command('INFO', {
-        response = function(response)
-            local info = {}
-            response:gsub('([^\r\n]*)\r\n', function(kv)
-                local k,v = kv:match(('([^:]*):([^:]*)'):rep(1))
-                if (k:match('db%d+')) then
-                    info[k] = {}
-                    v:gsub(',', function(dbkv)
-                        local dbk,dbv = kv:match('([^:]*)=([^:]*)')
-                        info[k][dbk] = dbv
-                    end)
-                else
-                    info[k] = v
+    slowlog          = command('SLOWLOG', {     -- >= 2.2.13
+        response = function(reply, command, ...)
+            if (type(reply) == 'table') then
+                local structured = { }
+                for index, entry in ipairs(reply) do
+                    structured[index] = {
+                        id = tonumber(entry[1]),
+                        timestamp = tonumber(entry[2]),
+                        duration = tonumber(entry[3]),
+                        command = entry[4],
+                    }
                 end
-            end)
-            return info
+                return structured
+            end
+
+            return reply
         end
     }),
+    info             = command('INFO', {
+        response = parse_info,
+    }),
 }
+
+-- ############################################################################
+
+return redis
